@@ -1,2 +1,2 @@
-# Health-tracking-analysis
+# health-tracking-analysis
 Health data analysis
