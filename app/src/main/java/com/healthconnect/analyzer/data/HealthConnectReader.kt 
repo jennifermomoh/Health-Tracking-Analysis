@@ -1,0 +1,158 @@
+package com.healthconnect.analyzer.data
+
+import android.content.Context
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.records.*
+import androidx.health.connect.client.request.ReadRecordsRequest
+import androidx.health.connect.client.time.TimeRangeFilter
+import com.healthconnect.analyzer.model.*
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+
+class HealthConnectReader(private val context: Context) {
+
+    private val client by lazy { HealthConnectClient.getOrCreate(context) }
+    private val dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneId.systemDefault())
+    private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault())
+
+    suspend fun isAvailable(): Boolean {
+        return HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE
+    }
+
+    suspend fun readAllData(days: Int = 90): HealthSnapshot {
+        val end = Instant.now()
+        val start = end.minus(days.toLong(), ChronoUnit.DAYS)
+        val range = TimeRangeFilter.between(start, end)
+
+        return HealthSnapshot(
+            exportedAt = timestampFormatter.format(Instant.now()),
+            periodDays = days,
+            steps = readSteps(range),
+            heartRate = readHeartRate(range),
+            sleep = readSleep(range),
+            workouts = readWorkouts(range),
+            weight = readWeight(range),
+            calories = readCalories(range),
+            hrv = readHrv(range)
+        )
+    }
+
+    private suspend fun readSteps(range: TimeRangeFilter): List<DailySteps> {
+        val records = client.readRecords(ReadRecordsRequest(StepsRecord::class, range)).records
+        return records.map { record ->
+            DailySteps(
+                date = dateFormatter.format(record.startTime),
+                count = record.count,
+                sourceApp = record.metadata.dataOrigin.packageName
+            )
+        }.groupBy { it.date to it.sourceApp }
+         .map { (key, entries) ->
+             DailySteps(key.first, entries.sumOf { it.count }, key.second)
+         }
+         .sortedBy { it.date }
+    }
+
+    private suspend fun readHeartRate(range: TimeRangeFilter): List<HeartRateSample> {
+        val records = client.readRecords(ReadRecordsRequest(HeartRateRecord::class, range)).records
+        return records.flatMap { record ->
+            record.samples.map { sample ->
+                HeartRateSample(
+                    timestamp = timestampFormatter.format(sample.time),
+                    beatsPerMinute = sample.beatsPerMinute,
+                    sourceApp = record.metadata.dataOrigin.packageName
+                )
+            }
+        }.sortedBy { it.timestamp }
+    }
+
+    private suspend fun readSleep(range: TimeRangeFilter): List<SleepSession> {
+        val records = client.readRecords(ReadRecordsRequest(SleepSessionRecord::class, range)).records
+        return records.map { record ->
+            val durationMinutes = ChronoUnit.MINUTES.between(record.startTime, record.endTime)
+            SleepSession(
+                date = dateFormatter.format(record.startTime),
+                startTime = timestampFormatter.format(record.startTime),
+                endTime = timestampFormatter.format(record.endTime),
+                durationMinutes = durationMinutes,
+                stages = record.stages.map { stage ->
+                    SleepStage(
+                        stage = stage.stage.name,
+                        startTime = timestampFormatter.format(stage.startTime),
+                        endTime = timestampFormatter.format(stage.endTime),
+                        durationMinutes = ChronoUnit.MINUTES.between(stage.startTime, stage.endTime)
+                    )
+                },
+                sourceApp = record.metadata.dataOrigin.packageName
+            )
+        }.sortedBy { it.date }
+    }
+
+    private suspend fun readWorkouts(range: TimeRangeFilter): List<WorkoutSession> {
+        val records = client.readRecords(ReadRecordsRequest(ExerciseSessionRecord::class, range)).records
+        val calorieMap = readWorkoutCalories(range)
+
+        return records.map { record ->
+            val durationMinutes = ChronoUnit.MINUTES.between(record.startTime, record.endTime)
+            WorkoutSession(
+                date = dateFormatter.format(record.startTime),
+                startTime = timestampFormatter.format(record.startTime),
+                endTime = timestampFormatter.format(record.endTime),
+                exerciseType = record.exerciseType.name,
+                durationMinutes = durationMinutes,
+                activeCalories = calorieMap[record.startTime.toString()],
+                sourceApp = record.metadata.dataOrigin.packageName
+            )
+        }.sortedBy { it.date }
+    }
+
+    private suspend fun readWorkoutCalories(range: TimeRangeFilter): Map<String, Double> {
+        val records = client.readRecords(ReadRecordsRequest(ActiveCaloriesBurnedRecord::class, range)).records
+        return records.associate { it.startTime.toString() to it.energy.inKilocalories }
+    }
+
+    private suspend fun readWeight(range: TimeRangeFilter): List<WeightEntry> {
+        val records = client.readRecords(ReadRecordsRequest(WeightRecord::class, range)).records
+        return records.map { record ->
+            WeightEntry(
+                date = dateFormatter.format(record.time),
+                weightKg = record.weight.inKilograms,
+                sourceApp = record.metadata.dataOrigin.packageName
+            )
+        }.sortedBy { it.date }
+    }
+
+    private suspend fun readCalories(range: TimeRangeFilter): List<CalorieEntry> {
+        val activeRecords = client.readRecords(ReadRecordsRequest(ActiveCaloriesBurnedRecord::class, range)).records
+        val totalRecords = client.readRecords(ReadRecordsRequest(TotalCaloriesBurnedRecord::class, range)).records
+
+        val totalByDate = totalRecords.groupBy { dateFormatter.format(it.startTime) }
+            .mapValues { (_, records) -> records.sumOf { it.energy.inKilocalories } }
+
+        return activeRecords
+            .groupBy { dateFormatter.format(it.startTime) to it.metadata.dataOrigin.packageName }
+            .map { (key, records) ->
+                CalorieEntry(
+                    date = key.first,
+                    activeCalories = records.sumOf { it.energy.inKilocalories },
+                    totalCalories = totalByDate[key.first],
+                    sourceApp = key.second
+                )
+            }
+            .sortedBy { it.date }
+    }
+
+    private suspend fun readHrv(range: TimeRangeFilter): List<HrvEntry> {
+        val records = client.readRecords(
+            ReadRecordsRequest(HeartRateVariabilityRmssdRecord::class, range)
+        ).records
+        return records.map { record ->
+            HrvEntry(
+                timestamp = timestampFormatter.format(record.time),
+                hrv = record.heartRateVariabilityMillis,
+                sourceApp = record.metadata.dataOrigin.packageName
+            )
+        }.sortedBy { it.timestamp }
+    }
+}

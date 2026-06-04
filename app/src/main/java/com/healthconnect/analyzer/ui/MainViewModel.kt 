@@ -1,0 +1,83 @@
+package com.healthconnect.analyzer.ui
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.permission.HealthPermission
+import androidx.health.connect.client.records.*
+import com.healthconnect.analyzer.data.HealthConnectReader
+import com.healthconnect.analyzer.export.JsonExporter
+import com.healthconnect.analyzer.model.HealthSnapshot
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import java.io.File
+
+sealed class UiState {
+    object Idle : UiState()
+    object CheckingAvailability : UiState()
+    object NotAvailable : UiState()
+    object RequestingPermissions : UiState()
+    object Loading : UiState()
+    data class Success(
+        val snapshot: HealthSnapshot,
+        val summary: Map<String, Any>,
+        val exportedFile: File
+    ) : UiState()
+    data class Error(val message: String) : UiState()
+}
+
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val reader = HealthConnectReader(application)
+    private val exporter = JsonExporter(application)
+    private val client by lazy { HealthConnectClient.getOrCreate(application) }
+
+    private val _uiState = MutableStateFlow<UiState>(UiState.Idle)
+    val uiState: StateFlow<UiState> = _uiState
+
+    val requiredPermissions = setOf(
+        HealthPermission.getReadPermission(StepsRecord::class),
+        HealthPermission.getReadPermission(HeartRateRecord::class),
+        HealthPermission.getReadPermission(SleepSessionRecord::class),
+        HealthPermission.getReadPermission(ExerciseSessionRecord::class),
+        HealthPermission.getReadPermission(WeightRecord::class),
+        HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class),
+        HealthPermission.getReadPermission(TotalCaloriesBurnedRecord::class),
+        HealthPermission.getReadPermission(HeartRateVariabilityRmssdRecord::class),
+    )
+
+    fun checkAndLoad(days: Int = 90) {
+        viewModelScope.launch {
+            _uiState.value = UiState.CheckingAvailability
+
+            if (!reader.isAvailable()) {
+                _uiState.value = UiState.NotAvailable
+                return@launch
+            }
+
+            val granted = client.permissionController.getGrantedPermissions()
+            if (!granted.containsAll(requiredPermissions)) {
+                _uiState.value = UiState.RequestingPermissions
+                return@launch
+            }
+
+            loadData(days)
+        }
+    }
+
+    fun loadData(days: Int = 90) {
+        viewModelScope.launch {
+            _uiState.value = UiState.Loading
+            try {
+                val snapshot = reader.readAllData(days)
+                val file = exporter.export(snapshot)
+                val summary = exporter.getSummaryStats(snapshot)
+                _uiState.value = UiState.Success(snapshot, summary, file)
+            } catch (e: Exception) {
+                _uiState.value = UiState.Error(e.message ?: "Unknown error reading health data")
+            }
+        }
+    }
+}
